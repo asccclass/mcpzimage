@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 繪圖佇列系統</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
+        .input-group { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: flex; gap: 10px; }
+        input[type="text"] { flex-grow: 1; padding: 12px; font-size: 16px; border: 1px solid #ddd; border-radius: 4px; }
+        button { padding: 12px 24px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        button:hover { background-color: #0056b3; }
+        
+        #task-list { margin-top: 30px; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }
+        .card { background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.05); transition: transform 0.2s; display: flex; flex-direction: column; }
+        .card-img { width: 100%; aspect-ratio: 1; background-color: #eee; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+        .card-img img { width: 100%; height: 100%; object-fit: cover; }
+        .card-body { padding: 15px; flex-grow: 1; display: flex; flex-direction: column; justify-content: space-between; }
+        .status-badge { display: inline-block; padding: 4px 8px; border-radius: 12px; font-size: 12px; font-weight: bold; margin-bottom: 8px; }
+        
+        .status-Pending { background-color: #ffeeba; color: #856404; }
+        .status-Processing { background-color: #b8daff; color: #004085; animation: pulse 1.5s infinite; }
+        .status-Completed { background-color: #c3e6cb; color: #155724; }
+        .status-Failed { background-color: #f5c6cb; color: #721c24; }
+        
+        .prompt-text { font-size: 14px; color: #333; margin: 0; word-break: break-all; }
+        .time-text { font-size: 12px; color: #888; margin-top: 10px; }
+
+        @keyframes pulse { 0% { opacity: 0.6; } 50% { opacity: 1; } 100% { opacity: 0.6; } }
+    </style>
+</head>
+<body>
+
+    <h1>Z-Image 生成佇列 (SQLite + WebSocket)</h1>
+    
+    <div class="input-group">
+        <input type="text" id="promptInput" placeholder="輸入提示詞 (Prompt)...">
+        <button onclick="sendTask()">送出任務</button>
+    </div>
+
+    <div id="task-list">
+        </div>
+
+<script>
+    let ws;
+    const taskList = document.getElementById('task-list');
+
+    function connectWS() {
+        // 自動判斷 ws:// 或 wss://
+        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        ws = new WebSocket(protocol + window.location.host + '/ws');
+
+        ws.onopen = function() {
+            console.log("WebSocket connected");
+            // 連線成功後，立即請求歷史紀錄
+            ws.send(JSON.stringify({ type: "get_history" }));
+        };
+
+        ws.onmessage = function(event) {
+            const msg = JSON.parse(event.data);
+            handleMessage(msg);
+        };
+
+        ws.onclose = function() {
+            console.log("WebSocket disconnected, retrying in 3s...");
+            setTimeout(connectWS, 3000); // 斷線重連
+        };
+    }
+
+    function handleMessage(msg) {
+        if (msg.type === 'history') {
+            // 清空列表並顯示歷史紀錄
+            taskList.innerHTML = '';
+            // 歷史紀錄通常是 desc 排序，我們反轉以便新任務在前面 (或維持原樣視UI需求)
+            msg.data.forEach(task => renderTask(task));
+        } else if (msg.type === 'new_task') {
+            // 新增任務到最前面
+            renderTask(msg.data, true);
+        } else if (msg.type === 'update') {
+            // 更新現有任務狀態
+            updateTaskElement(msg.data);
+        }
+    }
+
+    function sendTask() {
+        const input = document.getElementById('promptInput');
+        const prompt = input.value.trim();
+        if (!prompt) return;
+
+        ws.send(JSON.stringify({
+            type: "create_task",
+            prompt: prompt
+        }));
+        input.value = '';
+    }
+
+    function renderTask(task, prepend = false) {
+        // 如果已經存在 (可能透過 update 觸發)，則不重複建立
+        if (document.getElementById(`task-${task.id}`)) return;
+
+        const div = document.createElement('div');
+        div.className = 'card';
+        div.id = `task-${task.id}`;
+        div.innerHTML = generateCardHTML(task);
+
+        if (prepend) {
+            taskList.prepend(div);
+        } else {
+            taskList.appendChild(div);
+        }
+    }
+
+    function updateTaskElement(task) {
+        const el = document.getElementById(`task-${task.id}`);
+        if (el) {
+            el.innerHTML = generateCardHTML(task);
+        } else {
+            renderTask(task, true); // 如果找不到 DOM，就新增
+        }
+    }
+
+    function generateCardHTML(task) {
+        let imageHtml = `<div style="color:#aaa;">等待中...</div>`;
+        if (task.status === 'Processing') imageHtml = `<div>繪製中...</div>`;
+        if (task.status === 'Completed') imageHtml = `<img src="${task.image_path}" alt="result">`;
+        if (task.status === 'Failed') imageHtml = `<div>生成失敗</div>`;
+
+        return `
+            <div class="card-img">
+                ${imageHtml}
+            </div>
+            <div class="card-body">
+                <div>
+                    <span class="status-badge status-${task.status}">${task.status}</span>
+                    <p class="prompt-text">${task.prompt}</p>
+                </div>
+                <div class="time-text">ID: ${task.id}</div>
+            </div>
+        `;
+    }
+
+    // 啟動
+    connectWS();
+</script>
+
+</body>
+</html>
