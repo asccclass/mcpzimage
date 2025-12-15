@@ -16,6 +16,8 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"github.com/joho/godotenv"
+	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 )
 
 // --- 1. 資料庫模型 (SQLite) ---
@@ -72,34 +74,56 @@ func handleMessages() {
 func taskWorker() {
 	for {
 		var task Task
-		// 1. 找出一筆 "Pending" 的任務 (使用 Transaction 避免競爭)
-		// 這裡簡單使用 First，實際生產環境可用 Row locking
-		result := db.Where("status = ?", "Pending").Order("created_at asc").First(&task)
+		found := false
 
-		if result.Error == nil {
-			// 2. 標記為處理中
+		// 修正點：接收 err 並在下方檢查
+		err := db.Transaction(func(tx *gorm.DB) error {
+			// 1. 嘗試鎖定並讀取一筆 "Pending" 的任務
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("status = ?", "Pending").
+				Order("created_at asc").
+				First(&task).Error; err != nil {
+				return err
+			}
+
+			// 2. 找到任務後，立即在交易內標記為 "Processing"
 			task.Status = "Processing"
-			db.Save(&task)
-			notifyUpdate(task) // 通知前端狀態改變
+			if err := tx.Save(&task).Error; err != nil {
+				return err
+			}
+			found = true
+			return nil
+		})
+
+		// 修正點：這裡加入對 err 的檢查 (雖然主要邏輯依賴 found，但印出錯誤有助於除錯)
+		if err != nil && err != gorm.ErrRecordNotFound {
+			log.Printf("Database transaction error: %v", err)
+		}
+
+		if found {
+			// --- 交易已提交，鎖已釋放 ---
+			
+			// 通知前端
+			notifyUpdate(task)
 
 			// 3. 執行 Python 生成
 			log.Printf("Processing Task ID %d: %s", task.ID, task.Prompt)
-			imagePath, err := runPythonZImage(task.Prompt, task.ID)
+			imagePath, genErr := runPythonZImage(task.Prompt, task.ID) // 注意變數名稱避免衝突
 
-			// 4. 更新結果
-			if err != nil {
+			// 4. 更新最終結果
+			if genErr != nil {
 				task.Status = "Failed"
-				log.Printf("Task %d failed: %v", task.ID, err)
+				log.Printf("Task %d failed: %v", task.ID, genErr)
 			} else {
 				task.Status = "Completed"
 				task.ImagePath = imagePath
 				log.Printf("Task %d completed", task.ID)
 			}
 			db.Save(&task)
-			notifyUpdate(task) // 通知前端完成
+			notifyUpdate(task)
 
 		} else {
-			// 沒有任務，休息一下避免 CPU 飆高
+			// 沒有任務，休息一下
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -192,7 +216,9 @@ func main() {
    }
 	// 初始化 SQLite
 	var err error
-	db, err = gorm.Open(sqlite.Open(os.Getenv("DBPath") +"queue.db"), &gorm.Config{})
+	db, err = gorm.Open(sqlite.Open(os.Getenv("DBPath") +"queue.db"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent), // 設定為靜音模式
+	})
 	if err != nil {
 		log.Fatal("failed to connect database", err)
 	}
